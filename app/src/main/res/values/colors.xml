@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="app_red">#E60000</color>
+    <color name="app_red_dark">#B90000</color>
+    <color name="app_bg">#F5F6F8</color>
+    <color name="card_bg">#FFFFFF</color>
+    <color name="text_primary">#202124</color>
+    <color name="text_secondary">#6B7280</color>
+    <color name="line">#E5E7EB</color>
+    <color name="success">#15803D</color>
+    <color name="warning">#B45309</color>
+    <color name="danger">#B42318</color>
+    <color name="nav_inactive">#8A8F98</color>
+</resources>
