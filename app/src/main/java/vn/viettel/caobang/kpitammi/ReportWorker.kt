@@ -5,9 +5,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
@@ -15,6 +17,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.zip.ZipInputStream
 
 class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
@@ -26,7 +29,7 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         return try {
             val dir = ReportFiles.dayDir(applicationContext)
             val zip = File(dir, "KPI_ngay_${ReportFiles.today()}.zip")
-            download(sourceUrl, zip)
+            downloadFlexible(sourceUrl, zip)
 
             val out = ReportFiles.extractedDir(applicationContext)
             out.deleteRecursively()
@@ -48,25 +51,77 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         }
     }
 
-    private fun download(src: String, target: File) {
-        val conn = URL(src).openConnection() as HttpURLConnection
+    private fun downloadFlexible(src: String, target: File) {
+        val infoUrl = addParam(src, "action", "info")
+        val infoText = httpGetText(infoUrl)
+        val info = try { JSONObject(infoText) } catch (_: Exception) { null }
+
+        if (info != null && info.optBoolean("ok", false) &&
+            info.optString("mode") == "chunked-base64") {
+            val total = info.optInt("totalChunks", 0)
+            if (total <= 0) throw IOException("Apps Script không trả số chunk hợp lệ")
+
+            FileOutputStream(target).use { fos ->
+                for (i in 0 until total) {
+                    val chunkUrl = addParam(addParam(src, "action", "chunk"), "index", i.toString())
+                    val chunkText = httpGetText(chunkUrl)
+                    val obj = JSONObject(chunkText)
+                    if (!obj.optBoolean("ok", false)) {
+                        throw IOException(obj.optString("error", "Lỗi tải chunk $i"))
+                    }
+                    val b64 = obj.optString("dataBase64", "")
+                    if (b64.isBlank()) throw IOException("Chunk $i rỗng")
+                    fos.write(Base64.decode(b64, Base64.DEFAULT))
+                }
+            }
+        } else {
+            val bytes = httpGetBytes(src)
+            if (bytes.size >= 2 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte()) {
+                target.writeBytes(bytes)
+            } else {
+                val text = bytes.toString(Charsets.UTF_8).trim()
+                val json = JSONObject(text)
+                if (!json.optBoolean("ok", false)) {
+                    throw IOException(json.optString("error", "Nguồn trả về lỗi"))
+                }
+                val b64 = json.optString("dataBase64", "")
+                if (b64.isBlank()) throw IOException("Không có dataBase64")
+                target.writeBytes(Base64.decode(b64, Base64.DEFAULT))
+            }
+        }
+
+        val sig = ByteArray(2)
+        val n = target.inputStream().use { it.read(sig) }
+        if (n != 2 || sig[0].toInt() != 0x50 || sig[1].toInt() != 0x4B) {
+            throw IOException("File tải về không phải ZIP hợp lệ")
+        }
+    }
+
+    private fun httpGetText(url: String): String =
+        httpGetBytes(url).toString(Charsets.UTF_8)
+
+    private fun httpGetBytes(url: String): ByteArray {
+        val conn = URL(url).openConnection() as HttpURLConnection
         try {
             conn.connectTimeout = 20_000
-            conn.readTimeout = 60_000
+            conn.readTimeout = 90_000
             conn.instanceFollowRedirects = true
             conn.setRequestProperty("User-Agent", "Mozilla/5.0 KPI-Tammi")
+            conn.setRequestProperty("Accept", "application/json, application/zip, text/plain, */*")
             conn.connect()
-            if (conn.responseCode !in 200..299) throw IOException("HTTP ${conn.responseCode}")
-            target.outputStream().use { out -> conn.inputStream.use { input -> input.copyTo(out) } }
+            if (conn.responseCode !in 200..299) {
+                throw IOException("HTTP ${conn.responseCode}")
+            }
+            return conn.inputStream.use { it.readBytes() }
         } finally {
             conn.disconnect()
         }
+    }
 
-        val signature = ByteArray(2)
-        val read = target.inputStream().use { it.read(signature) }
-        if (read != 2 || signature[0].toInt() != 0x50 || signature[1].toInt() != 0x4B) {
-            throw IOException("Nguồn tải về không phải ZIP hợp lệ")
-        }
+    private fun addParam(url: String, key: String, value: String): String {
+        val sep = if (url.contains("?")) "&" else "?"
+        return url + sep + URLEncoder.encode(key, "UTF-8") + "=" +
+            URLEncoder.encode(value, "UTF-8")
     }
 
     private fun unzip(zipFile: File, dest: File) {
