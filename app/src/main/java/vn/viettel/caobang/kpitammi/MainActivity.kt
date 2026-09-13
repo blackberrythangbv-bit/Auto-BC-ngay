@@ -14,6 +14,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 
 class MainActivity : AppCompatActivity() {
@@ -39,7 +40,7 @@ class MainActivity : AppCompatActivity() {
             val h = hour.text.toString().toIntOrNull()?.coerceIn(0, 23) ?: 7
             val m = minute.text.toString().toIntOrNull()?.coerceIn(0, 59) ?: 30
             if (u.isBlank()) {
-                Toast.makeText(this, "Nhập URL file ZIP", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Nhập URL Apps Script", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
             prefs.edit().putString("url", u).putInt("hour", h).putInt("minute", m).apply()
@@ -48,8 +49,47 @@ class MainActivity : AppCompatActivity() {
         }
 
         findViewById<Button>(R.id.btnRun).setOnClickListener {
-            WorkManager.getInstance(this).enqueue(OneTimeWorkRequestBuilder<ReportWorker>().build())
-            status.text = "Đang tải và giải nén báo cáo..."
+            val u = url.text.toString().trim()
+            if (u.isBlank()) {
+                Toast.makeText(this, "Nhập URL Apps Script", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            prefs.edit().putString("url", u).apply()
+
+            val request = OneTimeWorkRequestBuilder<ReportWorker>().build()
+            val wm = WorkManager.getInstance(this)
+            wm.enqueue(request)
+            status.text = "Đang kết nối máy chủ báo cáo..."
+
+            wm.getWorkInfoByIdLiveData(request.id).observe(this) { info ->
+                if (info == null) return@observe
+
+                val current = info.progress.getInt("current", 0)
+                val total = info.progress.getInt("total", 0)
+                val phase = info.progress.getString("phase").orEmpty()
+
+                when (info.state) {
+                    WorkInfo.State.ENQUEUED -> status.text = "Đang chờ thực hiện..."
+                    WorkInfo.State.RUNNING -> {
+                        status.text = when {
+                            total > 0 && current > 0 -> "Đang tải dữ liệu: $current/$total khối..."
+                            phase.isNotBlank() -> phase
+                            else -> "Đang tải và giải nén báo cáo..."
+                        }
+                    }
+                    WorkInfo.State.SUCCEEDED -> {
+                        val count = info.outputData.getInt("count", 0)
+                        status.text = "HOÀN TẤT: Đã giải nén $count file. Bấm GỬI TAMMI."
+                        Toast.makeText(this, "Báo cáo đã sẵn sàng", Toast.LENGTH_LONG).show()
+                    }
+                    WorkInfo.State.FAILED -> {
+                        val error = info.outputData.getString("error") ?: "Không xác định"
+                        status.text = "LỖI: $error"
+                    }
+                    WorkInfo.State.CANCELLED -> status.text = "Đã hủy tác vụ."
+                    WorkInfo.State.BLOCKED -> status.text = "Đang chờ điều kiện hệ thống..."
+                }
+            }
         }
 
         findViewById<Button>(R.id.btnShare).setOnClickListener { shareExtracted() }
