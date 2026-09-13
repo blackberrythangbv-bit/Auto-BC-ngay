@@ -3,10 +3,15 @@ package vn.viettel.caobang.kpitammi
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.os.Build
+import android.os.Environment
+import android.provider.MediaStore
 import android.util.Base64
+import android.webkit.MimeTypeMap
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
@@ -51,22 +56,40 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 setProgress(workDataOf("phase" to "Nguồn chưa thay đổi, dùng dữ liệu đã có..."))
             }
 
-            val count = out.walkTopDown().count { it.isFile && ReportFiles.allowed(it) }
+            val files = out.walkTopDown().filter { it.isFile && ReportFiles.allowed(it) }.toList()
+            val count = files.size
             cleanupOld(3)
+
             if (count > 0) {
+                setProgress(workDataOf("phase" to "Đang lưu báo cáo vào thư mục Download..."))
+                val export = exportToDownloads(files)
                 val elapsedMs = System.currentTimeMillis() - startedAt
-                val message = if (cached) {
-                    "Nguồn chưa thay đổi, dùng lại $count file đã có."
-                } else {
-                    "Đã tải và giải nén $count file trong ${elapsedMs / 1000.0}s."
+                val downloadPath = "Download/KPI_Tammi/${ReportFiles.today()}"
+                val message = when {
+                    export.count == count && cached ->
+                        "Nguồn chưa thay đổi; dùng lại $count file và đã lưu vào $downloadPath."
+                    export.count == count ->
+                        "Đã tải, giải nén $count file và lưu vào $downloadPath trong ${elapsedMs / 1000.0}s."
+                    export.count > 0 ->
+                        "Đã chuẩn bị $count file; lưu được ${export.count}/$count file vào $downloadPath."
+                    else ->
+                        "Đã chuẩn bị $count file. Không thể tạo bản sao công khai trong Download trên thiết bị này."
                 }
+
+                prefs.edit()
+                    .putString("last_export_path", downloadPath)
+                    .putInt("last_export_count", export.count)
+                    .apply()
+
                 RunHistory.add(applicationContext, "Thành công", count, message)
-                notifyReady(count)
+                notifyReady(count, export.count, downloadPath)
                 Result.success(
                     workDataOf(
                         "count" to count,
                         "cached" to cached,
-                        "elapsedMs" to elapsedMs
+                        "elapsedMs" to elapsedMs,
+                        "exportCount" to export.count,
+                        "exportPath" to downloadPath
                     )
                 )
             } else {
@@ -195,7 +218,7 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             conn.instanceFollowRedirects = true
             conn.useCaches = false
             conn.setRequestProperty("Connection", "keep-alive")
-            conn.setRequestProperty("User-Agent", "KPI-Tammi/1.3 Android")
+            conn.setRequestProperty("User-Agent", "KPI-Tammi/1.3.1 Android")
             conn.setRequestProperty("Accept", "application/json, application/zip, text/plain, */*")
             conn.connect()
             if (conn.responseCode !in 200..299) {
@@ -235,6 +258,76 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         }
     }
 
+    private data class ExportResult(val count: Int)
+
+    private fun exportToDownloads(files: List<File>): ExportResult {
+        var exported = 0
+        val date = ReportFiles.today()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val resolver = applicationContext.contentResolver
+            val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            val relativePath = "${Environment.DIRECTORY_DOWNLOADS}/KPI_Tammi/$date/"
+
+            files.forEach { file ->
+                try {
+                    val selection = "${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.RELATIVE_PATH}=?"
+                    resolver.delete(collection, selection, arrayOf(file.name, relativePath))
+
+                    val values = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+                        put(MediaStore.MediaColumns.MIME_TYPE, mimeTypeFor(file))
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                        put(MediaStore.MediaColumns.IS_PENDING, 1)
+                    }
+                    val uri = resolver.insert(collection, values) ?: return@forEach
+                    resolver.openOutputStream(uri, "w")?.use { output ->
+                        file.inputStream().use { input -> input.copyTo(output, 64 * 1024) }
+                    } ?: run {
+                        resolver.delete(uri, null, null)
+                        return@forEach
+                    }
+                    val done = ContentValues().apply {
+                        put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    }
+                    resolver.update(uri, done, null, null)
+                    exported++
+                } catch (_: Exception) {
+                    // Bản nội bộ của app vẫn được giữ nguyên nếu thiết bị chặn ghi Download.
+                }
+            }
+        } else {
+            try {
+                @Suppress("DEPRECATION")
+                val root = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val folder = File(root, "KPI_Tammi/$date").apply { mkdirs() }
+                files.forEach { file ->
+                    try {
+                        file.copyTo(File(folder, file.name), overwrite = true)
+                        exported++
+                    } catch (_: Exception) {
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return ExportResult(exported)
+    }
+
+    private fun mimeTypeFor(file: File): String {
+        val ext = file.extension.lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when (ext) {
+            "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "xls" -> "application/vnd.ms-excel"
+            "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            "csv" -> "text/csv"
+            "pdf" -> "application/pdf"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            else -> "application/octet-stream"
+        }
+    }
+
     private fun cleanupOld(days: Int) {
         val cutoff = System.currentTimeMillis() - days * 24L * 60L * 60L * 1000L
         ReportFiles.baseDir(applicationContext).listFiles()?.forEach {
@@ -242,7 +335,7 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         }
     }
 
-    private fun notifyReady(count: Int) {
+    private fun notifyReady(count: Int, exportCount: Int, downloadPath: String) {
         val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         val channel = "kpi_report"
         nm.createNotificationChannel(
@@ -260,12 +353,18 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val detail = if (exportCount == count) {
+            "Đã lưu $count file tại $downloadPath"
+        } else {
+            "Đã chuẩn bị $count file; lưu Download $exportCount/$count file"
+        }
+
         nm.notify(
             730,
             NotificationCompat.Builder(applicationContext, channel)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .setContentTitle("Báo cáo KPI đã sẵn sàng")
-                .setContentText("Đã chuẩn bị $count file. Chạm để Gửi Tammi.")
+                .setContentText(detail)
                 .setContentIntent(pi)
                 .addAction(android.R.drawable.ic_menu_share, "Gửi Tammi", pi)
                 .setAutoCancel(true)
