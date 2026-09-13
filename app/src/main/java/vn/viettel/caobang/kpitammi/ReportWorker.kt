@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
@@ -19,46 +20,74 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.zip.ZipInputStream
 
 class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
+        val startedAt = System.currentTimeMillis()
         val prefs = applicationContext.getSharedPreferences("kpi_tammi", Context.MODE_PRIVATE)
         val sourceUrl = prefs.getString("url", "")?.trim().orEmpty()
         if (sourceUrl.isBlank()) {
-            return Result.failure(workDataOf("error" to "Chưa cấu hình URL Apps Script"))
+            val msg = "Chưa cấu hình nguồn báo cáo"
+            RunHistory.add(applicationContext, "Lỗi", 0, msg)
+            return Result.failure(workDataOf("error" to msg))
         }
 
         return try {
             setProgress(workDataOf("phase" to "Đang kiểm tra nguồn báo cáo..."))
             val dir = ReportFiles.dayDir(applicationContext)
             val zip = File(dir, "KPI_ngay_${ReportFiles.today()}.zip")
-            downloadFlexible(sourceUrl, zip)
+            val cached = downloadFlexible(sourceUrl, zip, prefs)
 
-            setProgress(workDataOf("phase" to "Đã tải ZIP, đang giải nén..."))
             val out = ReportFiles.extractedDir(applicationContext)
-            out.deleteRecursively()
-            out.mkdirs()
-            unzip(zip, out)
+            if (!cached) {
+                setProgress(workDataOf("phase" to "Đã tải ZIP, đang giải nén..."))
+                out.deleteRecursively()
+                out.mkdirs()
+                unzip(zip, out)
+            } else {
+                setProgress(workDataOf("phase" to "Nguồn chưa thay đổi, dùng dữ liệu đã có..."))
+            }
 
             val count = out.walkTopDown().count { it.isFile && ReportFiles.allowed(it) }
             cleanupOld(3)
             if (count > 0) {
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                val message = if (cached) {
+                    "Nguồn chưa thay đổi, dùng lại $count file đã có."
+                } else {
+                    "Đã tải và giải nén $count file trong ${elapsedMs / 1000.0}s."
+                }
+                RunHistory.add(applicationContext, "Thành công", count, message)
                 notifyReady(count)
-                Result.success(workDataOf("count" to count))
+                Result.success(
+                    workDataOf(
+                        "count" to count,
+                        "cached" to cached,
+                        "elapsedMs" to elapsedMs
+                    )
+                )
             } else {
                 val msg = "ZIP không có file báo cáo hợp lệ"
+                RunHistory.add(applicationContext, "Lỗi", 0, msg)
                 notifyError(msg)
                 Result.failure(workDataOf("error" to msg))
             }
         } catch (e: Exception) {
             val msg = e.message ?: "Không xác định"
+            RunHistory.add(applicationContext, "Lỗi", 0, msg)
             notifyError(msg)
             Result.failure(workDataOf("error" to msg))
         }
     }
 
-    private suspend fun downloadFlexible(src: String, target: File) {
+    private suspend fun downloadFlexible(
+        src: String,
+        target: File,
+        prefs: SharedPreferences
+    ): Boolean {
         val infoUrl = addParam(src, "action", "info")
         val infoText = httpGetText(infoUrl)
         val info = try { JSONObject(infoText) } catch (_: Exception) { null }
@@ -66,25 +95,52 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         if (info != null && info.optBoolean("ok", false) &&
             info.optString("mode") == "chunked-base64") {
             val total = info.optInt("totalChunks", 0)
+            val expectedSize = info.optLong("size", -1L)
+            val modified = info.optString("modifiedTime", "")
             if (total <= 0) throw IOException("Apps Script không trả số chunk hợp lệ")
 
-            FileOutputStream(target).use { fos ->
-                for (i in 0 until total) {
-                    setProgress(workDataOf(
-                        "phase" to "Đang tải dữ liệu...",
-                        "current" to (i + 1),
-                        "total" to total
-                    ))
-                    val chunkUrl = addParam(addParam(src, "action", "chunk"), "index", i.toString())
-                    val chunkText = httpGetText(chunkUrl)
-                    val obj = JSONObject(chunkText)
-                    if (!obj.optBoolean("ok", false)) {
-                        throw IOException(obj.optString("error", "Lỗi tải chunk $i"))
-                    }
-                    val b64 = obj.optString("dataBase64", "")
-                    if (b64.isBlank()) throw IOException("Chunk $i rỗng")
-                    fos.write(Base64.decode(b64, Base64.DEFAULT))
+            val existingCount = ReportFiles.extractedDir(applicationContext)
+                .walkTopDown()
+                .count { it.isFile && ReportFiles.allowed(it) }
+            val lastModified = prefs.getString("last_source_modified", "").orEmpty()
+            if (modified.isNotBlank() && modified == lastModified && existingCount > 0) {
+                return true
+            }
+
+            val executor = Executors.newFixedThreadPool(minOf(3, total))
+            try {
+                val futures = (0 until total).map { index ->
+                    executor.submit(Callable { fetchChunk(src, index) })
                 }
+
+                FileOutputStream(target).use { fos ->
+                    for (i in 0 until total) {
+                        val chunk = try {
+                            futures[i].get()
+                        } catch (e: Exception) {
+                            throw IOException(
+                                e.cause?.message ?: e.message ?: "Lỗi tải khối ${i + 1}/$total"
+                            )
+                        }
+                        fos.write(chunk)
+                        setProgress(
+                            workDataOf(
+                                "phase" to "Đang tải dữ liệu...",
+                                "current" to (i + 1),
+                                "total" to total
+                            )
+                        )
+                    }
+                }
+            } finally {
+                executor.shutdownNow()
+            }
+
+            if (expectedSize > 0 && target.length() != expectedSize) {
+                throw IOException("Dung lượng ZIP không khớp: ${target.length()}/$expectedSize byte")
+            }
+            if (modified.isNotBlank()) {
+                prefs.edit().putString("last_source_modified", modified).apply()
             }
         } else {
             setProgress(workDataOf("phase" to "Đang tải ZIP trực tiếp..."))
@@ -110,6 +166,22 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
         if (n != 2 || sig[0].toInt() != 0x50 || sig[1].toInt() != 0x4B) {
             throw IOException("File tải về không phải ZIP hợp lệ")
         }
+        return false
+    }
+
+    private fun fetchChunk(src: String, index: Int): ByteArray {
+        val chunkUrl = addParam(addParam(src, "action", "chunk"), "index", index.toString())
+        val obj = try {
+            JSONObject(httpGetText(chunkUrl))
+        } catch (_: Exception) {
+            throw IOException("Khối ${index + 1} trả về dữ liệu không hợp lệ")
+        }
+        if (!obj.optBoolean("ok", false)) {
+            throw IOException(obj.optString("error", "Lỗi tải khối ${index + 1}"))
+        }
+        val b64 = obj.optString("dataBase64", "")
+        if (b64.isBlank()) throw IOException("Khối ${index + 1} rỗng")
+        return Base64.decode(b64, Base64.DEFAULT)
     }
 
     private fun httpGetText(url: String): String =
@@ -118,10 +190,12 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     private fun httpGetBytes(url: String): ByteArray {
         val conn = URL(url).openConnection() as HttpURLConnection
         try {
-            conn.connectTimeout = 20_000
-            conn.readTimeout = 90_000
+            conn.connectTimeout = 12_000
+            conn.readTimeout = 45_000
             conn.instanceFollowRedirects = true
-            conn.setRequestProperty("User-Agent", "Mozilla/5.0 KPI-Tammi")
+            conn.useCaches = false
+            conn.setRequestProperty("Connection", "keep-alive")
+            conn.setRequestProperty("User-Agent", "KPI-Tammi/1.3 Android")
             conn.setRequestProperty("Accept", "application/json, application/zip, text/plain, */*")
             conn.connect()
             if (conn.responseCode !in 200..299) {
@@ -153,7 +227,7 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                     out.mkdirs()
                 } else {
                     out.parentFile?.mkdirs()
-                    FileOutputStream(out).use { fos -> zis.copyTo(fos) }
+                    FileOutputStream(out).use { fos -> zis.copyTo(fos, 64 * 1024) }
                 }
                 zis.closeEntry()
                 entry = zis.nextEntry
@@ -191,7 +265,7 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             NotificationCompat.Builder(applicationContext, channel)
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .setContentTitle("Báo cáo KPI đã sẵn sàng")
-                .setContentText("Đã giải nén $count file. Chạm để Gửi Tammi.")
+                .setContentText("Đã chuẩn bị $count file. Chạm để Gửi Tammi.")
                 .setContentIntent(pi)
                 .addAction(android.R.drawable.ic_menu_share, "Gửi Tammi", pi)
                 .setAutoCancel(true)
