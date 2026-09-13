@@ -9,6 +9,7 @@ import android.util.Base64
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.File
@@ -24,13 +25,17 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
     override suspend fun doWork(): Result {
         val prefs = applicationContext.getSharedPreferences("kpi_tammi", Context.MODE_PRIVATE)
         val sourceUrl = prefs.getString("url", "")?.trim().orEmpty()
-        if (sourceUrl.isBlank()) return Result.failure()
+        if (sourceUrl.isBlank()) {
+            return Result.failure(workDataOf("error" to "Chưa cấu hình URL Apps Script"))
+        }
 
         return try {
+            setProgress(workDataOf("phase" to "Đang kiểm tra nguồn báo cáo..."))
             val dir = ReportFiles.dayDir(applicationContext)
             val zip = File(dir, "KPI_ngay_${ReportFiles.today()}.zip")
             downloadFlexible(sourceUrl, zip)
 
+            setProgress(workDataOf("phase" to "Đã tải ZIP, đang giải nén..."))
             val out = ReportFiles.extractedDir(applicationContext)
             out.deleteRecursively()
             out.mkdirs()
@@ -40,18 +45,20 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
             cleanupOld(3)
             if (count > 0) {
                 notifyReady(count)
-                Result.success()
+                Result.success(workDataOf("count" to count))
             } else {
-                notifyError("ZIP không có file báo cáo hợp lệ")
-                Result.failure()
+                val msg = "ZIP không có file báo cáo hợp lệ"
+                notifyError(msg)
+                Result.failure(workDataOf("error" to msg))
             }
         } catch (e: Exception) {
-            notifyError(e.message ?: "Không xác định")
-            Result.retry()
+            val msg = e.message ?: "Không xác định"
+            notifyError(msg)
+            Result.failure(workDataOf("error" to msg))
         }
     }
 
-    private fun downloadFlexible(src: String, target: File) {
+    private suspend fun downloadFlexible(src: String, target: File) {
         val infoUrl = addParam(src, "action", "info")
         val infoText = httpGetText(infoUrl)
         val info = try { JSONObject(infoText) } catch (_: Exception) { null }
@@ -63,6 +70,11 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
 
             FileOutputStream(target).use { fos ->
                 for (i in 0 until total) {
+                    setProgress(workDataOf(
+                        "phase" to "Đang tải dữ liệu...",
+                        "current" to (i + 1),
+                        "total" to total
+                    ))
                     val chunkUrl = addParam(addParam(src, "action", "chunk"), "index", i.toString())
                     val chunkText = httpGetText(chunkUrl)
                     val obj = JSONObject(chunkText)
@@ -75,12 +87,15 @@ class ReportWorker(appContext: Context, params: WorkerParameters) : CoroutineWor
                 }
             }
         } else {
+            setProgress(workDataOf("phase" to "Đang tải ZIP trực tiếp..."))
             val bytes = httpGetBytes(src)
             if (bytes.size >= 2 && bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte()) {
                 target.writeBytes(bytes)
             } else {
                 val text = bytes.toString(Charsets.UTF_8).trim()
-                val json = JSONObject(text)
+                val json = try { JSONObject(text) } catch (_: Exception) {
+                    throw IOException("Nguồn trả về không phải ZIP/JSON hợp lệ")
+                }
                 if (!json.optBoolean("ok", false)) {
                     throw IOException(json.optString("error", "Nguồn trả về lỗi"))
                 }
